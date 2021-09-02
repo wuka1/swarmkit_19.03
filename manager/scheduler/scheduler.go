@@ -3,6 +3,8 @@ package scheduler
 import (
 	"context"
 	"time"
+        "sort"
+        "unsafe"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/api/genericresource"
@@ -25,6 +27,11 @@ const (
 type schedulingDecision struct {
 	old *api.Task
 	new *api.Task
+}
+
+type commonSpecKey struct {
+    serviceID   string
+    specVersion api.Version
 }
 
 // Scheduler assigns tasks to nodes.
@@ -374,10 +381,10 @@ func (s *Scheduler) processPreassignedTasks(ctx context.Context) {
 
 // tick attempts to schedule the queue.
 func (s *Scheduler) tick(ctx context.Context) {
-	type commonSpecKey struct {
-		serviceID   string
-		specVersion api.Version
-	}
+//	type commonSpecKey struct {
+//		serviceID   string
+//		specVersion api.Version
+//	}
 	tasksByCommonSpec := make(map[commonSpecKey]map[string]*api.Task)
 	var oneOffTasks []*api.Task
 	schedulingDecisions := make(map[string]schedulingDecision, len(s.unassignedTasks))
@@ -408,12 +415,16 @@ func (s *Scheduler) tick(ctx context.Context) {
 		delete(s.unassignedTasks, taskID)
 	}
 
-	for _, taskGroup := range tasksByCommonSpec {
-		s.scheduleTaskGroup(ctx, taskGroup, schedulingDecisions)
-	}
-	for _, t := range oneOffTasks {
-		s.scheduleTaskGroup(ctx, map[string]*api.Task{t.ID: t}, schedulingDecisions)
-	}
+	// 根据memory的降序进行指派task
+       s.scheduleTaskGroupByCommonSpec(ctx, tasksByCommonSpec, schedulingDecisions)
+       s.scheduleTaskGroupOneOff(ctx, oneOffTasks, schedulingDecisions)
+
+//	for _, taskGroup := range tasksByCommonSpec {
+//		s.scheduleTaskGroup(ctx, taskGroup, schedulingDecisions)
+//	}
+//	for _, t := range oneOffTasks {
+//		s.scheduleTaskGroup(ctx, map[string]*api.Task{t.ID: t}, schedulingDecisions)
+//	}
 
 	_, failed := s.applySchedulingDecisions(ctx, schedulingDecisions)
 	for _, decision := range failed {
@@ -428,6 +439,100 @@ func (s *Scheduler) tick(ctx context.Context) {
 		s.enqueue(decision.old)
 	}
 }
+
+// 根据memory的降序进行指派task
+func (s *Scheduler) scheduleTaskGroupOneOff(ctx context.Context, oneOffTasks []*api.Task, schedulingDecisions map[string]schedulingDecision){
+    // 用于记录内存，用于排序
+    var memory_list = []int{}
+    var memory int64
+
+    // 用于标记task是否指派
+    var task_assign_flag map[string]string;
+    task_assign_flag = make(map[string]string)
+
+    for _, t := range oneOffTasks {
+        // 收集memory_list
+        memory = (*(*t.Spec.Resources).Limits).MemoryBytes
+        memory_list = append(memory_list, *(*int)(unsafe.Pointer(&memory)))
+        // 默认未指派
+        task_assign_flag[t.ID] = "false"
+    }
+
+    // 降序排列
+    sort.Sort(sort.Reverse(sort.IntSlice(memory_list)))
+    log.G(ctx).Infof("memory of oneOffTasks is: %v", memory_list)
+
+    // 根据memory降序的方式遍历task
+    for _, mem_value := range memory_list{
+        // 定义t
+        var t *api.Task
+        for _, assign_task := range oneOffTasks {
+            memory = (*(*assign_task.Spec.Resources).Limits).MemoryBytes
+            // memory相同且未指派的task
+            if mem_value == *(*int)(unsafe.Pointer(&memory)) && task_assign_flag[assign_task.ID] == "false"{
+                t = assign_task
+                task_assign_flag[assign_task.ID] = "true"
+                // 指派任务
+                s.scheduleTaskGroup(ctx, map[string]*api.Task{t.ID: t}, schedulingDecisions)
+                break
+            }
+        }
+    }
+}
+
+
+// 根据memory的降序进行指派task
+func (s *Scheduler) scheduleTaskGroupByCommonSpec(ctx context.Context, tasksByCommonSpec map[commonSpecKey]map[string]*api.Task, schedulingDecisions map[string]schedulingDecision){
+    // 用于记录内存，用于排序
+    var memory_list = []int{}
+    var memory int64
+
+    // 用于标记task_group是否指派
+    var task_group_assign_flag map[commonSpecKey]string;
+    task_group_assign_flag = make(map[commonSpecKey]string)
+
+    for commonSpecKeyInfo, taskGroup := range tasksByCommonSpec {
+        for taskID := range taskGroup{
+            // 收集memory_list
+            memory = (*(*(*taskGroup[taskID]).Spec.Resources).Limits).MemoryBytes
+            memory_list = append(memory_list, *(*int)(unsafe.Pointer(&memory)))
+            // 默认未指派
+            task_group_assign_flag[commonSpecKeyInfo] = "false"
+        }
+    }
+
+    // 降序排列
+    sort.Sort(sort.Reverse(sort.IntSlice(memory_list)))
+    log.G(ctx).Infof("memory of tasksByCommonSpec is: %v", memory_list)
+
+    var scheduleTaskGroupFlag string
+
+    // 根据memory降序的方式遍历task
+    for _, mem_value := range memory_list{
+        for commonSpecKeyInfo, taskGroup := range tasksByCommonSpec {
+            // task_group已指派
+            if task_group_assign_flag[commonSpecKeyInfo] == "true"{
+                continue
+            }
+            scheduleTaskGroupFlag = "false"
+            for taskID, _ := range taskGroup{
+                 memory = (*(*(*taskGroup[taskID]).Spec.Resources).Limits).MemoryBytes
+                // memory相同且未指派的task
+                if mem_value == *(*int)(unsafe.Pointer(&memory)) && task_group_assign_flag[commonSpecKeyInfo] == "false"{
+                    task_group_assign_flag[commonSpecKeyInfo] = "true"
+                    scheduleTaskGroupFlag = "true"
+                    // 指派任务
+                    s.scheduleTaskGroup(ctx, taskGroup, schedulingDecisions)
+                    break
+                }
+            }
+            if scheduleTaskGroupFlag == "true"{
+                break
+            }
+        }
+    }
+}
+
 
 func (s *Scheduler) applySchedulingDecisions(ctx context.Context, schedulingDecisions map[string]schedulingDecision) (successful, failed []schedulingDecision) {
 	if len(schedulingDecisions) == 0 {
